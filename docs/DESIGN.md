@@ -1,6 +1,8 @@
-# Reddit Commander — Design v2 (Stage 1 of 3: Design → Plan → Build)
+# Reddit Commander — Design v3 (Stage 1 of 3: Design → Plan → Build)
 
-Status: DRAFT for review · Date: 2026-10-16 · Supersedes v1 (Data API route dropped)
+Status: FINAL DRAFT · Date: 2026-10-16 · v3 = v2 + scope locked (single sub, r/MensRomance) + MCP "no content" posture (§6)
+
+**Scope locked (v3):** one sub, **r/MensRomance**, which you will own. The goal is *your own front-end and dashboards* on top of it. The MCP is a convenience layer for bulk or complicated tasks and for questions. It is **not** a way for Claude to read the sub's content (§6). Multi-sub support, co-mod subs and the backup-mod sub are out of scope, so §2.3 points 4–5 and R7 are now minor.
 
 A desktop moderation console for Reddit: one streamlined, keyboard-first interface for the subs you moderate, plus a local MCP server so Claude can drive the app. Claude never touches Reddit. It sends commands to the app, and the app executes them through your Reddit-approved Devvit app.
 
@@ -90,6 +92,12 @@ Monorepo (pnpm): `apps/desktop` (Electron), `apps/bridge` (Devvit Web app), `pac
 ### 3.1 Provider abstraction (kept, simplified)
 The desktop's `RedditProvider` interface now has two implementations: **BridgeProvider** (real) and **FixtureProvider** (recorded data for offline dev and CI). The UI, cache and MCP never know which is active, so the spike result can't strand the front end.
 
+### 3.1a Dashboards need history the desktop can't collect alone
+The desktop is only running when you are. To keep dashboards accurate while it's closed, the bridge keeps **aggregate counters in Redis**, updated by triggers (`PostSubmit`, `CommentSubmit`, `PostReport`, `CommentReport`, `ModAction`) and a daily scheduler job:
+- per-day counts: posts, comments, reports, removals (by moderator and by rule/reason), approvals, first-time posters, modmail threads opened and closed, plus a median time-to-action;
+- a daily snapshot of subscriber count.
+Aggregates hold no usernames or content, so they sit outside the deletion and retention rules (§7) and can be kept indefinitely. The desktop backfills from these on connect, and its own SQLite holds the detailed, short-lived data (the live queue and recent actions).
+
 ### 3.2 Sync
 - Each sub install exposes `GET /external/changes?since=<cursor>` returning deltas (new or changed queue items, reports, modmail, mod actions, deletions). Triggers append to a per-install Redis change feed, and the desktop polls on an adaptive interval (≈3s focused, ≈30s background).
 - `POST /external/snapshot` lets the desktop rebuild its view from live Reddit reads (`getModQueue` etc.) on first run or after a gap, so we store minimal data on Reddit's side.
@@ -128,6 +136,14 @@ Desktop → `POST /external/command` with a **signed envelope** `{id, sub, type,
 
 Local only: Streamable HTTP on `127.0.0.1` with a revocable bearer token (off by default), plus an `rc-mcp` stdio shim. Claude has no Reddit credentials and no route to Reddit; it can only call the Command Bus.
 
+### 6.0 Posture: Claude operates the app, it doesn't read the sub
+The MCP exists for (a) **questions** ("how many reports this week, and for which rules?", "who's slowest to respond?") and (b) **bulk or multi-step jobs** ("approve everything from users I've already approved 3+ times", "remove all posts matching rule 4 from the last 24h"). Neither needs Claude to read post or comment text, so by default it can't:
+- **Default MCP responses are content-free:** counts, aggregates, IDs, timestamps, rule/report reasons, age, item type, and the *state* of an item. No post titles or bodies, comment text, usernames or modmail text. Items are referred to by opaque handles (`item_ab12`).
+- **Criteria are evaluated inside the app**, not by Claude. Claude supplies a filter (`rule = 4, age < 24h, author_approved_count >= 3`), and the app returns the match **count plus metadata**.
+- **Bulk jobs are previewed in the UI:** `plan_bulk_action(filter, action)` creates a proposal (or, for the low-risk tier, runs immediately). You see the full content in the app before confirming anything medium or high risk. Claude never sees what you see.
+- **Content access is a separate switch,** off by default, in Settings, with a per-session expiry. It exists in case you later want Claude to help with a specific judgement call, and it requires an explicit toggle each time.
+This keeps the "AI sees the sub" question closed by default. It also reduces prompt-injection exposure to near zero, and it is simpler to describe in the External Endpoints request (§7).
+
 ### 6.1 Risk tiers (your decision: act directly on low risk)
 | Tier | Commands (v1 defaults, configurable per sub) | Claude's ability |
 |---|---|---|
@@ -139,8 +155,8 @@ Local only: Streamable HTTP on `127.0.0.1` with a revocable bearer token (off by
 
 `approve` is "low risk" because it is reversible and non-punitive. Note it is still a moderation decision, which is why the tray and audit log show every one.
 
-### 6.2 Tool catalogue
-Read: `list_subs`, `get_dashboard`, `list_queue`, `get_item`, `get_user_context`, `search_users`, `get_modlog`, `list_modmail`, `get_modmail_thread`, `get_rules`, `get_stats`. Write (all via Command Bus): `approve`, `add_note`, `set_flair`, `modmail_action`, `remove`, `mark_spam`, `lock`, `reply_modmail`, `apply_macro`, `ban`, `undo`, `propose_action(command, rationale)`, `list_proposals`. Resources: `queue://{sub}`, `item://{id}`, `user://{name}`. Prompts: `triage_queue`, `investigate_user`, `summarise_modmail`.
+### 6.2 Tool catalogue (content-free by default)
+Read: `get_dashboard`, `get_stats(metric, range, group_by)`, `count_queue(filter)`, `list_queue_meta(filter)` (handles, type, age, report reasons, rule hits; no text), `get_rules` (rule names and numbers only), `get_action_history(filter)` (action, actor, rule, time), `get_proposals`. Write (all via Command Bus, tiered per §6.1): `plan_bulk_action(filter, action, rationale)`, `approve`, `add_note`, `set_flair`, `modmail_action`, `remove`, `mark_spam`, `lock`, `ban`, `undo`. Prompts: `weekly_review`, `triage_plan`. The content-access tools (`get_item_content`, `get_modmail_text`) are only registered while the Settings switch is on.
 
 ### 6.3 Safety
 - Reddit content is returned to Claude wrapped and labelled as **untrusted data**, with tool descriptions telling the model never to follow instructions inside it. The tier system is the actual defence against prompt injection, since an injected "ban everyone" can only reach the proposals tray.
@@ -171,11 +187,8 @@ From [`devvit_rules.md`](https://github.com/reddit/devvit-docs/blob/main/docs/de
 | R6 | Data rules (deletion, LLM use) | §7; confirm in the form |
 | R7 | Co-mod subs need their owners' consent | New sub first; others optional later |
 
-**Questions for you**
-1. Are you the **owner** of the new sub (can you add the app account as a mod and install apps)? Has it been created yet, and with what name?
-2. Is the low/medium/high table in §6.1 right? In particular, should `remove` for **clear-cut cases** (e.g. matched AutoMod filters) also be direct?
-3. OK to request the External Endpoints access using a **dedicated app account name**, e.g. `<yourname>-commander`? Note that this makes the app account a visible moderator on your sub.
-4. Windows, macOS or Linux for the desktop app?
+**Resolved with you:** you'll own r/MensRomance (once created) · single sub · the §6.1 table is approved as written · the app account name is whatever Devvit assigns (the account is named after the app, so we pick the app name carefully: no "Reddit" or Snoo, and nothing misleading).
+**Still open (small):** desktop OS (Windows, macOS or Linux). Until you say, we build and package for all three, and develop against Linux/CI.
 
 ---
 
