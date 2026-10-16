@@ -1,205 +1,184 @@
-# Reddit Commander — Design (Stage 1 of 3: Design → Plan → Build)
+# Reddit Commander — Design v2 (Stage 1 of 3: Design → Plan → Build)
 
-Status: DRAFT for review · Date: 2026-10-16
+Status: DRAFT for review · Date: 2026-10-16 · Supersedes v1 (Data API route dropped)
 
-A desktop moderation console for Reddit: one streamlined, keyboard-first interface across every subreddit you moderate, plus a local MCP server so Claude can drive the app. Claude never touches Reddit. It sends commands to the app, and the app executes them with your credentials, the same as if you had clicked.
+A desktop moderation console for Reddit: one streamlined, keyboard-first interface for the subs you moderate, plus a local MCP server so Claude can drive the app. Claude never touches Reddit. It sends commands to the app, and the app executes them through your Reddit-approved Devvit app.
+
+**Decisions so far (yours):** no Data API route · Devvit first · primary target is a **new sub you're building**, plus a backup-mod role on one sub and co-mod on a small one · Claude may **act directly on low-risk actions**.
 
 ---
 
 ## 1. Goals / non-goals
 
 **Goals**
-1. One unified dashboard across all moderated subs: queue depth, report spikes, modmail backlog, activity, team action.
-2. Triage with minimal clicking. Reports, modqueue, spam, unmoderated and edited items sit in one list. The user context is inline, and every action is one keystroke.
-3. Context where you need it: the author's history in your subs, past bans/notes, previous removals, and other reports on the same user.
-4. A local MCP server so Claude can read app state and issue commands through the same code path the UI uses.
-5. Fast. The app works from a local cache, shows optimistic updates, and syncs in the background.
+1. One dashboard across your subs: queue depth, report spikes, modmail backlog, team activity.
+2. Triage with minimal clicking. Reports, modqueue, spam, unmoderated and edited items sit in one list. The author's context is inline, and every action is one keystroke.
+3. A local MCP server so Claude can read app state and issue commands through the same code path the UI uses.
+4. Fast, with a local cache and optimistic updates.
 
 **Non-goals (v1)**
-- Not a general Reddit client (no browsing, voting or posting as a regular user).
-- No scraping, no cookie or session hijacking, no old.reddit automation. Official API only.
-- Not a cloud service. Everything runs locally and there is no backend of ours.
-- No autonomous AI actions. Claude proposes and acts only through the gated command bus (§6).
+- Not a general Reddit client (no browsing, voting or posting).
+- No scraping or session or cookie reuse. Official platform only.
+- No backend of ours (see §2.3: the only server-side code is the Devvit app, which Reddit hosts).
+- Claude never gets Reddit credentials, and cannot act outside the gated command bus (§6).
 
 ---
 
-## 2. The gating constraint: how we're allowed to talk to Reddit
+## 2. Platform verdict: what Devvit can and can't do
 
-This decides the architecture, so it comes first. **I could not reach Reddit's own pages from this environment, so everything below is from secondary press coverage (TechRepublic, PPC Land, etc.) and must be verified before we commit.**
+Researched from Reddit's official [devvit-docs](https://github.com/reddit/devvit-docs) repo (read directly, not press coverage). The public Data API timeline from v1 remains unverified press coverage and is no longer relevant to this design.
 
-What the coverage says as of Oct 2026:
-- Reddit's [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy) requires explicit approval before any API access. It describes moderator tooling as the intended use case.
-- Self-service OAuth app creation is closed or redirected. Approval reportedly takes weeks and can be denied without explanation.
-- **New public Data API requests reportedly stop on Oct 31, 2026.** Removal of unregistered apps starts Jan 12, 2027, and remaining public Data API access ends around March 2027. ([TechRepublic](https://www.techrepublic.com/article/news-reddit-rss-public-api-shutdown/), [PPC Land](https://ppc.land/reddit-to-halt-public-data-api-access-in-march-2027-as-14-000-apps-register/))
-- Reddit is steering apps to **Devvit**, its hosted developer platform. Apps run on Reddit's infrastructure, per-subreddit, with triggers, storage and scheduler. Python is not supported, and external connections and cross-sub processing need extra approval.
+### 2.1 What Devvit can do (for a mod tool)
+- **The full moderator read/write surface** in the `reddit` client: `getModQueue`, `getReports`, `getSpam`, `getUnmoderated`, `getEdited`, `getModerationLog`, `approve`, `remove`, `banUser`/`unbanUser`, `muteUser`, mod notes (`addModNote`/`getModNotes`), removal reasons, rules, flair, a **ModMail service**, user lookups and a user's posts/comments. ([API reference](https://github.com/reddit/devvit-docs/tree/main/docs/api/redditapi))
+- **Triggers** (`PostReport`, `CommentReport`, `PostSubmit`, `ModAction`, `AutomoderatorFilterPost`, …), a **scheduler**, **Redis** storage, and settings/secrets. That is enough to run autonomous rules on Reddit's side too (e.g. auto-approve trusted users in your new sub).
+- **No API keys or OAuth app.** Authentication is handled by the platform.
+- **Unlisted apps** are the default. Your app is installable only on subs you choose, and approval for private use is much lighter than a public listing. Playtest installs are allowed on subs with **<200 subscribers**, which fits a brand-new sub, and a reviewed app is needed beyond that. ([launch guide](https://github.com/reddit/devvit-docs/blob/main/docs/guides/launch/launch-guide.md))
 
-**Implication:** a desktop app that calls the Data API as you may have a short shelf life, or may never get approved. Devvit is not a drop-in replacement either. It is an in-Reddit app model, not a client SDK. Devvit apps act as the app account (or as the user only in some user-initiated contexts), and they can't be called from outside except through patterns we have to design (§3.3).
-
-### Strategy: a provider abstraction with two backends
-
-All Reddit access goes through one interface, `RedditProvider`. The UI, the cache and the MCP server never know which backend is active.
-
-| | **A. Data API provider** (primary) | **B. Devvit bridge provider** (contingency) |
+### 2.2 What Devvit can't do (the dead ends)
+| Idea | Verdict | Source |
 |---|---|---|
-| Identity of actions | You (OAuth, `modself`, `modposts`, `modcontributors`, `modlog`, `modmail`, `read`, `identity`, `history`…) | Devvit app account, unless Reddit grants run-as-user |
-| Mod log attribution | Your username | App name (e.g. `u/commander-bridge`) |
-| Latency | Poll | Triggers push events, but delivery goes through the app |
-| Setup | Apply for access **now** | Build and install a Devvit app on each sub (you are mod, so you can) |
-| Risk | Approval denied or sunset in 2027 | Attribution and capability differences, extra approvals for `fetch` |
+| Desktop app calls Reddit **as you** | **Dead end.** There is no user OAuth token for outside callers. | `reddit-api.mdx` |
+| Mod actions **attributed to you** via Devvit | **Dead end.** Actions run as the **app account**. "Run as user" exists only for submit post/comment and subscribe, and only on an explicit manual click. | [`userActions.mdx`](https://github.com/reddit/devvit-docs/blob/main/docs/capabilities/server/userActions.mdx) |
+| Devvit app calls **your own server** (outbound fetch) | **Dead end.** Personal domains "will not be approved". | [`http-fetch-policy.md`](https://github.com/reddit/devvit-docs/blob/main/docs/capabilities/server/http-fetch-policy.md) |
+| Devvit app calls **Claude** | **Dead end.** Only OpenAI and Gemini are allowed AI providers. | same |
+| An app that spans many subs | **Partial.** Each install is per-sub with its own data, and cross-sub processing needs extra approval. | migration notes |
 
-**Recommendation**
-1. **Apply for Data API access immediately**, before Oct 31. A personal-use moderator tool is the best case under the policy. This costs nothing and is the long pole.
-2. Build against `RedditProvider` with backend A first, plus a `FixtureProvider` (recorded JSON). The fixture provider lets us build the whole app without credentials, so approval delays don't block us.
-3. Prototype backend B early (a spike in the Plan stage) so we know whether it is viable before 2027.
+### 2.3 The viable path: Devvit app as the hands, Electron as the face
+Devvit has a documented, sanctioned way for an outside service to start a request: **External Endpoints with managed tokens**. ([`external-endpoints.mdx`](https://github.com/reddit/devvit-docs/blob/main/docs/capabilities/server/external-endpoints.mdx)) It is for "an external service initiates requests to your app", which is what a desktop console does, so this is not a workaround.
+
+```
+Electron app ──HTTPS + managed token──► <app>-<subId>-external.devvit.net/external/…
+                                         │  (Devvit server, runs on Reddit)
+                                         ▼
+                              reddit.getModQueue(), reddit.approve(), …  ──► Reddit
+```
+
+Constraints we have to design around (all from the docs):
+1. **Limited-access feature.** Reddit must grant access via a request form. *This replaces the Data API application as the long pole. Submit it now.*
+2. **Everything executes as the app account**, and the mod log will show the app's username. We mitigate this by writing "via Commander, requested by u/you" into mod notes and removal notes (§3.3).
+3. Limits: **5 requests/second**, 10 MB bodies, HTTPS only. There is **no push** to the desktop, so the app polls (§3.2). A single poll returns a batch of deltas, so the budget is comfortable.
+4. **Managed tokens are global across all installs** of the app, so a leaked token controls every sub. See §7.
+5. The app account must be added as a moderator with scoped permissions. For subs where you aren't the owner (backup mod, co-mod), their owners have to agree to install it. **Start on the new sub.**
+6. Beyond 200 subscribers an app needs Reddit's review, which "typically takes approximately one week" and repeats when we publish changes.
+
+**Verdict:** Devvit is **not a dead end** for what you want, but it changes the shape. The desktop app can't be "you" to Reddit. It is the control surface for a Devvit app that acts as the app account, and the approval that matters is External Endpoints access. If that is denied, the fallback is a **Devvit-only** build: a mod dashboard rendered inside Reddit (menu actions, mod-only custom post or webview) with no desktop app and no MCP, and only the UX survives. So run a **feasibility spike first** (§9).
 
 ---
 
 ## 3. Architecture
 
 ```
-┌──────────────────────────── Electron app ─────────────────────────────┐
-│  Renderer (React + TS, Vite)          Main process (Node, TS)         │
-│  ─────────────────────────            ───────────────────────────     │
-│  Dashboard / Queue / Modmail /  IPC   Command Bus  ◄── MCP server     │
-│  Users / Log / Settings   ◄──────────► (single write path)   (local)  │
-│  Zustand + TanStack Query             │                                │
-│  cmdk palette, virtual lists          ├─ Action Executor (rate limited,│
-│                                       │   undo, audit)                 │
-│                                       ├─ Sync Engine (pollers)         │
-│                                       ├─ SQLite cache (better-sqlite3) │
-│                                       └─ RedditProvider ──► Reddit     │
-│                                          (DataApi | Devvit | Fixture)  │
-└────────────────────────────────────────────────────────────────────────┘
-        ▲ Claude Desktop / Claude Code connect to the MCP endpoint
+┌────────────────────── Electron app (local) ──────────────────────┐
+│ Renderer (React/TS/Vite)        Main process (Node/TS)           │
+│ Dashboard · Queue · Modmail ◄─► Command Bus ◄─── MCP server      │
+│ Users · Log · Settings   IPC    ├ Policy engine (risk tiers)     │
+│                                 ├ Sync engine (delta polling)    │
+│                                 ├ SQLite cache + audit log       │
+│                                 └ BridgeClient ──► Devvit app    │
+└──────────────────────────────────────────────────────────────────┘
+        Claude Desktop / Claude Code ──MCP (127.0.0.1)──► Command Bus
+
+┌────────── Devvit app "Commander Bridge" (hosted by Reddit) ──────┐
+│ /external/* endpoints (managed token + signed envelope)          │
+│ Triggers → Redis change feed (IDs + minimal metadata, TTL)       │
+│ reddit.* mod calls · policy re-check · deletion handling         │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.1 Process split and security
-- Renderer has **no Node access and no network**. `contextIsolation: true`, `sandbox: true`, strict CSP, and a typed preload bridge. All Reddit I/O lives in the main process.
-- Tokens are stored encrypted via Electron `safeStorage` (OS keychain). They are never sent to the renderer or the MCP server, and never logged.
-- All untrusted Reddit text (post bodies, usernames, mod notes) is treated as hostile: rendered through a sanitising markdown renderer, and **flagged as untrusted data in MCP responses** to resist prompt injection (§6.4).
+Monorepo (pnpm): `apps/desktop` (Electron), `apps/bridge` (Devvit Web app), `packages/protocol` (zod schemas and types shared by both, so the wire format is typed end to end), `packages/fixtures`.
 
-### 3.2 Core services (main process)
-- **Provider**: normalised types (`Item`, `Report`, `User`, `ModAction`, `ModmailThread`, …). Backend quirks stay behind the interface.
-- **Sync Engine**: per-sub pollers for modqueue, reports, unmoderated, spam, edited, modmail and modlog. It uses `before` fullname cursors, adaptive intervals (fast when the window is focused, slow in the background), and a **global rate-limit budget** shared with user-initiated actions. User actions always preempt background sync.
-- **Cache (SQLite)**: items, users, subs, actions, notes, settings and the audit log. It's the source of truth for the UI, so the UI never waits on the network. WAL mode, FTS5 for search.
-- **Command Bus**: every mutation is a typed command (`removeItem`, `approveItem`, `banUser`, `sendModmailReply`, …). It is validated with zod, checked against permission policy, rate limited, executed, recorded in the audit log and, where possible, made undoable. **The UI and MCP use the same bus**, so Claude can't do anything you can't do by hand, and nothing bypasses auditing.
+### 3.1 Provider abstraction (kept, simplified)
+The desktop's `RedditProvider` interface now has two implementations: **BridgeProvider** (real) and **FixtureProvider** (recorded data for offline dev and CI). The UI, cache and MCP never know which is active, so the spike result can't strand the front end.
 
-### 3.3 Devvit bridge (backend B, sketch)
-A small Devvit app installed on each sub:
-- Triggers (`PostReport`, `CommentReport`, `ModAction`, `PostSubmit`, …) push events to a relay by `fetch`.
-- The app polls a command queue and executes mod actions with `reddit.*` as the app account.
-- The relay is a local tunnel or tiny hosted endpoint, which breaks the "no backend of ours" rule. It is therefore contingency only, and needs `fetch` domain approval. Details are deferred to the spike.
+### 3.2 Sync
+- Each sub install exposes `GET /external/changes?since=<cursor>` returning deltas (new or changed queue items, reports, modmail, mod actions, deletions). Triggers append to a per-install Redis change feed, and the desktop polls on an adaptive interval (≈3s focused, ≈30s background).
+- `POST /external/snapshot` lets the desktop rebuild its view from live Reddit reads (`getModQueue` etc.) on first run or after a gap, so we store minimal data on Reddit's side.
+- All 5 rps budget goes through one limiter. User actions preempt background sync.
+
+### 3.3 Commands and attribution
+Desktop → `POST /external/command` with a **signed envelope** `{id, sub, type, args, requestedBy, source: "ui"|"mcp", ts, sig}`. The bridge verifies the signature, checks the policy and replay protection, runs the reddit call, and writes a **mod note** (`requested by u/you via Commander (ui|mcp)`) so the human and the channel are on record even though the mod log shows the app account.
+
+### 3.4 Security (desktop)
+`contextIsolation`, `sandbox`, strict CSP and a typed preload; renderer has no Node and no network. Tokens and the signing key live in the OS keychain (Electron `safeStorage`) and never reach the renderer or the MCP. All Reddit text is rendered through a sanitising markdown pipeline.
 
 ---
 
 ## 4. Stack
-
-| Concern | Choice | Why |
-|---|---|---|
-| Shell | **Electron** + **electron-vite** (Vite for main, preload, renderer) | As requested. electron-vite gives HMR for all three targets. |
-| Language | TypeScript (strict) across everything | Shared types for IPC, commands and MCP. |
-| UI | React 19, Tailwind, Radix primitives (shadcn-style components) | Fast to build, accessible and modern. |
-| State | TanStack Query (server cache over IPC), Zustand (UI state) | Simple, with good invalidation. |
-| Lists | TanStack Virtual | Queues can hold thousands of items. |
-| Palette / keys | cmdk, custom hotkey layer | Keyboard-first triage. |
-| Storage | better-sqlite3 + Drizzle (migrations), FTS5 | Fast, local and typed. |
-| Validation | zod (commands, IPC, MCP schemas, provider responses) | One schema, many uses. |
-| MCP | Official `@modelcontextprotocol/sdk` | Streamable HTTP on `127.0.0.1` plus a stdio shim (`rc-mcp`). |
-| Tests | Vitest (unit), Playwright (Electron E2E, with FixtureProvider) | Fully offline CI. |
-| Packaging | electron-builder (Win/mac/Linux), auto-update later | |
-
-Alternative considered: Tauri (smaller, Rust). Rejected because you asked for Electron, and the shared TS across main and renderer is valuable here. No better option for this scope.
-
----
-
-## 5. UX design
-
-### 5.1 Dashboard (home)
-- **Sub cards** show queue count, reports, modmail unread, 24h removals/approvals, and a sparkline vs. 7-day baseline. Anomalies (e.g. a report spike or a brigading signature) are highlighted.
-- **Needs attention**: oldest unhandled items, escalations, threads awaiting your reply.
-- **Team pulse**: who acted recently, so you can avoid double handling.
-- **Quick actions**: jump to the queue, open the palette, snooze a sub.
-
-### 5.2 Unified Queue (the main screen)
-- Three panes: filters/subs, virtualized item list, and a detail pane with the item, the report reasons, and the **user context card**.
-- **Everything in one list**: modqueue, reports, spam, unmoderated and edited items. Filter by sub, type, reason, age or author.
-- **Keyboard triage**: `j/k` move, `a` approve, `r` remove (opens the reason picker), `s` spam, `l` lock, `b` ban, `n` note, `e` escalate, `z` undo, `/` filter, `⌘K` palette. Actions apply optimistically and can be undone for N seconds.
-- **User context card**: account age, karma in your subs, post/comment history within your subs, previous removals/bans/notes, and other open reports from the same author. No click-through is required.
-- **Bulk select** (`x`) with group-by-author and group-by-reason.
-- **Removal reasons and macros**: pick a rule, send the removal comment or modmail with templates. Macros are configurable (remove + lock + comment + note + optional ban).
-
-### 5.3 Other views
-- **Modmail**: threaded inbox, assign, archive, highlight, canned replies, and the user context card alongside.
-- **Users**: search a user across all your subs, with a full action history and notes (stored locally; syncing with Reddit usernotes is a later option).
-- **Mod log**: searchable, filterable, with a diff-style view and "who did what".
-- **Rules and automations**: view rules, removal reasons and AutoModerator config (read-only in v1).
-- **Settings**: accounts, keys and hotkeys, rate-limit behaviour, MCP permissions.
-
----
-
-## 6. MCP server
-
-Goal: Claude helps you moderate by operating *the app*. It has no Reddit credentials and no network path to Reddit.
-
-### 6.1 Transport and access
-- Streamable HTTP bound to `127.0.0.1`, protected by a random bearer token generated in Settings (revocable and rotatable). The stdio shim `rc-mcp` forwards to it for clients that need stdio.
-- Off by default. Enabling it is an explicit toggle and the UI shows connection state.
-
-### 6.2 Permission tiers (per connection, set in Settings)
-| Tier | Claude can… |
+| Concern | Choice |
 |---|---|
-| **Read** (default) | Read queues, items, users, the modlog, modmail, stats and rules |
-| **Propose** | Also create *proposals*. These are queued actions that appear in an "AI proposals" tray and **run only when you approve them** (one keypress, or batch-approve). |
-| **Act (scoped)** | Execute chosen low-risk commands directly (e.g. approve, add note, assign). Destructive ones (ban, mass-remove, modmail send) still require approval. |
-
-All commands go through the Command Bus, so audit, rate limits and undo apply equally. Every audit entry records `source: "mcp"`, the client name and the originating prompt context where available.
-
-### 6.3 Tool catalogue (draft)
-- **Read**: `list_subs`, `get_dashboard`, `list_queue(sub?, filter?)`, `get_item(id)`, `get_user_context(username, sub?)`, `search_users`, `get_modlog(filters)`, `list_modmail`, `get_modmail_thread`, `get_rules(sub)`, `get_stats(sub, range)`.
-- **Write (via bus)**: `approve`, `remove(reason?)`, `mark_spam`, `lock`, `ban(duration, reason, message)`, `add_note`, `reply_modmail`, `apply_macro`, `undo(actionId)`, `snooze_sub`.
-- **Proposals**: `propose_action(command, rationale)`, `list_proposals`.
-- **Resources**: `queue://{sub}`, `item://{id}`, `user://{name}`. **Prompts**: `triage_queue`, `summarise_modmail`, `investigate_user`.
-
-### 6.4 Safety
-- **Prompt-injection defence**: Reddit content returned to Claude is wrapped and labelled as untrusted user data, and tool descriptions tell the model never to follow instructions inside it. Write tools are the real defence: tiering, proposals and approval gates mean an injected "ban everyone" can't execute silently.
-- **Hard limits**: per-minute caps on write commands via MCP, no bulk destructive command above a threshold without approval, and a global kill switch (tray icon and hotkey) that revokes the MCP token instantly.
-- **Full audit log**, exportable, visible in-app.
+| Desktop | **Electron + electron-vite** (Vite for main, preload and renderer), TypeScript strict |
+| Bridge | **Devvit Web** (`@devvit/web`, Hono or Express server, TypeScript) |
+| UI | React, Tailwind, Radix primitives, cmdk, TanStack Query and Virtual, Zustand |
+| Storage | better-sqlite3 + Drizzle, FTS5 |
+| Contracts | zod in `packages/protocol` (IPC, bridge wire format, MCP schemas) |
+| MCP | `@modelcontextprotocol/sdk`: Streamable HTTP on `127.0.0.1` plus a stdio shim |
+| Tests | Vitest, Playwright for Electron (FixtureProvider), Devvit's playtest and `devvit test` for the bridge |
 
 ---
 
-## 7. Data model (SQLite, abridged)
-`accounts` · `subs` (flags, last_sync cursors) · `items` (id, kind, sub, author, body, state, reports_json, created, edited) · `users` (name, first_seen, flags) · `user_sub_stats` · `mod_actions` (local + synced modlog) · `notes` · `modmail_threads` / `modmail_messages` · `macros` · `removal_reasons` · `proposals` · `audit_log` (source, command, args, result, undo_token) · `settings` · FTS tables on `items`, `modmail_messages`, `notes`.
+## 5. UX (unchanged from v1 in essence)
+- **Dashboard:** sub cards (queue, reports, modmail unread, 24h actions, sparkline vs. baseline), a needs-attention list, and a team-activity strip. For a new sub, a **growth and health** panel: new posts, first-time posters, removal rate, response time.
+- **Unified Queue:** three panes (filters, virtualised list, detail plus user context card). Keys: `j/k` move · `a` approve · `r` remove (reason picker) · `s` spam · `l` lock · `b` ban · `n` note · `z` undo · `⌘K` palette. Optimistic with undo.
+- **User context card:** account age, history in your subs, past removals, bans and notes (from Reddit mod notes via `getModNotes`), and other open reports by the same author.
+- **Modmail**, **Users**, **Mod log**, **Macros and removal reasons**, **Settings**.
 
 ---
 
-## 8. Rate limiting & sync strategy
-- Stated limit is ~60–100 requests/min per OAuth client (**unverified**). The app implements a token-bucket budget, configurable and conservative by default.
-- Priority order: user actions > the focused view's refresh > background pollers.
-- Multi-sub: fetch the combined `r/a+b+c/about/modqueue` endpoint where possible to spend one request for many subs.
-- Back off on `429` and use the `X-Ratelimit-*` headers.
+## 6. MCP server and permission policy
 
----
+Local only: Streamable HTTP on `127.0.0.1` with a revocable bearer token (off by default), plus an `rc-mcp` stdio shim. Claude has no Reddit credentials and no route to Reddit; it can only call the Command Bus.
 
-## 9. Risks & open questions
-
-| # | Item | Mitigation / decision needed |
+### 6.1 Risk tiers (your decision: act directly on low risk)
+| Tier | Commands (v1 defaults, configurable per sub) | Claude's ability |
 |---|---|---|
-| R1 | **API approval denied or delayed, with a 2027 sunset** | Apply now; provider abstraction; Fixture backend; Devvit spike |
-| R2 | Devvit attribution and capability differences | Spike before committing; may be a degraded mode |
-| R3 | Reddit ToS: actions must be user-initiated moderation only | Proposal/approval gating; no autonomous loops; get the policy text verified |
-| R4 | Prompt injection via Reddit content | §6.4 |
-| R5 | Rate limits vs. many subs | Shared budget, combined endpoints, adaptive polling |
-| R6 | Unverified facts in this doc (dates, limits) | Verify against Reddit's official pages (they were unreachable from this environment) |
+| **Read** | everything readable | always |
+| **Low risk → acts directly** | `approve` · `add_note` · set/clear flair · modmail mark-read, archive, highlight, assign · snooze, tag or label (local) · `undo` | executes immediately, audited, undoable |
+| **Medium → propose, one-key approve** | `remove` (with reason) · `mark_spam` · `lock` · sticky/distinguish · `reply_modmail` · apply removal comment or macro | queued in the **AI Proposals tray**; you approve singly or in batch |
+| **High → propose, explicit confirm** | `ban`/`mute`/`unban` · any batch above N items · anything touching rules, wiki or AutoModerator config | shown with a summary; no batch approve for permanent bans |
+| **Not exposed** | moderator invites, removals and permission changes; sub settings | n/a |
+
+`approve` is "low risk" because it is reversible and non-punitive. Note it is still a moderation decision, which is why the tray and audit log show every one.
+
+### 6.2 Tool catalogue
+Read: `list_subs`, `get_dashboard`, `list_queue`, `get_item`, `get_user_context`, `search_users`, `get_modlog`, `list_modmail`, `get_modmail_thread`, `get_rules`, `get_stats`. Write (all via Command Bus): `approve`, `add_note`, `set_flair`, `modmail_action`, `remove`, `mark_spam`, `lock`, `reply_modmail`, `apply_macro`, `ban`, `undo`, `propose_action(command, rationale)`, `list_proposals`. Resources: `queue://{sub}`, `item://{id}`, `user://{name}`. Prompts: `triage_queue`, `investigate_user`, `summarise_modmail`.
+
+### 6.3 Safety
+- Reddit content is returned to Claude wrapped and labelled as **untrusted data**, with tool descriptions telling the model never to follow instructions inside it. The tier system is the actual defence against prompt injection, since an injected "ban everyone" can only reach the proposals tray.
+- Rate caps on MCP-initiated writes, a global **kill switch** (tray icon and hotkey) that revokes the MCP token instantly, and a full exportable audit log (`source`, client, args, result, undo token).
+- Policy is enforced **twice**: in the desktop Command Bus and again in the Devvit bridge, so a compromised desktop can't exceed what the bridge allows.
+
+---
+
+## 7. Compliance and data handling (Devvit Rules)
+From [`devvit_rules.md`](https://github.com/reddit/devvit-docs/blob/main/docs/devvit_rules.md). These apply because Reddit data leaves Reddit into your local cache.
+- **Deletions:** honor `PostDelete`, `CommentDelete` and account deletions. The bridge emits tombstones in the change feed, and **the desktop purges the content and any references**, including from the local audit log text. Retention goal is ≤30 days for stored user data (Redis TTL).
+- **Data minimisation:** the bridge stores IDs and minimal metadata only, and reads content live.
+- **Never:** profile or surveil redditors, sell or share data, or train models on it. Sending content to Claude is a user-initiated local flow, but it is exactly the kind of thing to **state plainly in the External Endpoints request** and get a yes on, rather than assume.
+- **Secrets:** the managed token is global across installs, shown once, and revocable. It sits in the keychain, rotates from Settings, and requests also need the signed envelope, so the token alone can't issue commands.
+- **Consent of co-mods:** the app account becomes a mod. It's installed only where that sub's mod team agrees. App description and README must explain this plainly.
+- **Naming:** no Reddit trademarks or Snoo in the app name or logo. "Reddit Commander" as a repo name is fine, but the app's public name should avoid "Reddit".
+
+---
+
+## 8. Risks and open questions
+| # | Risk | Mitigation |
+|---|---|---|
+| R1 | External Endpoints access denied or slow (limited-access form) | Submit now; spike on playtest; fallback is a Devvit-only in-Reddit dashboard |
+| R2 | Actions show as app account, not you | Mod-note attribution; accepted trade-off. Ask Reddit whether a named app account (e.g. `u/<yourname>-commander`) is fine |
+| R3 | 5 rps and no push | Delta feed and adaptive polling; benchmark in spike |
+| R4 | Global managed token | Keychain, rotation, signed envelopes, bridge-side policy |
+| R5 | Review required >200 subs; repeats per publish | Plan releases; the new sub starts <200 so playtest covers early dev |
+| R6 | Data rules (deletion, LLM use) | §7; confirm in the form |
+| R7 | Co-mod subs need their owners' consent | New sub first; others optional later |
 
 **Questions for you**
-1. Have you already got Data API credentials or applied for them? If not, you should apply this week (see §2).
-2. How many subs do you moderate, and roughly how large are the queues? This affects polling and caching decisions.
-3. Platforms: Windows, macOS, Linux?
-4. Is the "Act (scoped)" MCP tier wanted, or do you prefer propose-and-approve for everything in v1?
-5. Do you use Toolbox usernotes or Mod Notes today? We should be compatible with your existing notes.
-6. Should a single account be assumed, or multiple mod accounts?
+1. Are you the **owner** of the new sub (can you add the app account as a mod and install apps)? Has it been created yet, and with what name?
+2. Is the low/medium/high table in §6.1 right? In particular, should `remove` for **clear-cut cases** (e.g. matched AutoMod filters) also be direct?
+3. OK to request the External Endpoints access using a **dedicated app account name**, e.g. `<yourname>-commander`? Note that this makes the app account a visible moderator on your sub.
+4. Windows, macOS or Linux for the desktop app?
 
 ---
 
-## 10. Preview of the Plan stage (next)
-Milestones: M0 scaffold (electron-vite, IPC, CI, FixtureProvider) → M1 data layer + sync + queue view → M2 actions, undo and audit (Command Bus) → M3 dashboard and user context → M4 modmail and modlog → M5 MCP server and proposals → M6 Data API backend with real OAuth, then Devvit spike, then packaging. The Plan stage will break these into tickets with acceptance criteria and the test strategy.
+## 9. Plan preview (next stage)
+- **M0 Spike (gates everything):** Devvit app with one install on a test sub (<200 members), one external endpoint (`/changes` plus `/command approve`), a throwaway Node client proving the full loop and latency, plus the access request filed.
+- M1 Scaffold monorepo, protocol, FixtureProvider, Electron shell. M2 Queue and sync. M3 Command Bus, policy, audit, undo. M4 Dashboard and user context. M5 MCP server and the proposals tray. M6 Modmail and modlog. M7 Hardening, review submission, packaging.
