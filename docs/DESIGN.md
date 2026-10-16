@@ -1,12 +1,8 @@
 # Reddit Commander — Design v3 (Stage 1 of 3: Design → Plan → Build)
 
-Status: FINAL DRAFT · Date: 2026-10-16 · v3 = v2 + scope locked (single sub, r/MensRomance) + MCP "no content" posture (§6)
+Status: FINAL DRAFT · Date: 2026-10-16 · v3 = v2 + scope locked (single sub, r/MensRomance) + MCP defined as a natural-language interface to the app (§6)
 
-**Scope locked (v3):** one sub, **r/MensRomance**, which you will own. The goal is *your own front-end and dashboards* on top of it. The MCP is a convenience layer for bulk or complicated tasks and for questions. It is **not** a way for Claude to read the sub's content (§6). Multi-sub support, co-mod subs and the backup-mod sub are out of scope, so §2.3 points 4–5 and R7 are now minor.
-
-A desktop moderation console for Reddit: one streamlined, keyboard-first interface for the subs you moderate, plus a local MCP server so Claude can drive the app. Claude never touches Reddit. It sends commands to the app, and the app executes them through your Reddit-approved Devvit app.
-
-**Decisions so far (yours):** no Data API route · Devvit first · primary target is a **new sub you're building**, plus a backup-mod role on one sub and co-mod on a small one · Claude may **act directly on low-risk actions**.
+**Scope locked (v3):** one sub, **r/MensRomance**, which you will own. The goal is *your own front-end and dashboards* on top of it. The app is the only thing that talks to Reddit, and it sees and does everything a mod can. The MCP is a **natural-language interface to the app**. Claude can do what you can do in the UI (ask questions, run bulk or multi-step jobs) and nothing else; it has no path to Reddit and no credentials. Multi-sub support and the backup-mod and co-mod subs are out of scope.
 
 ---
 
@@ -136,13 +132,13 @@ Desktop → `POST /external/command` with a **signed envelope** `{id, sub, type,
 
 Local only: Streamable HTTP on `127.0.0.1` with a revocable bearer token (off by default), plus an `rc-mcp` stdio shim. Claude has no Reddit credentials and no route to Reddit; it can only call the Command Bus.
 
-### 6.0 Posture: Claude operates the app, it doesn't read the sub
-The MCP exists for (a) **questions** ("how many reports this week, and for which rules?", "who's slowest to respond?") and (b) **bulk or multi-step jobs** ("approve everything from users I've already approved 3+ times", "remove all posts matching rule 4 from the last 24h"). Neither needs Claude to read post or comment text, so by default it can't:
-- **Default MCP responses are content-free:** counts, aggregates, IDs, timestamps, rule/report reasons, age, item type, and the *state* of an item. No post titles or bodies, comment text, usernames or modmail text. Items are referred to by opaque handles (`item_ab12`).
-- **Criteria are evaluated inside the app**, not by Claude. Claude supplies a filter (`rule = 4, age < 24h, author_approved_count >= 3`), and the app returns the match **count plus metadata**.
-- **Bulk jobs are previewed in the UI:** `plan_bulk_action(filter, action)` creates a proposal (or, for the low-risk tier, runs immediately). You see the full content in the app before confirming anything medium or high risk. Claude never sees what you see.
-- **Content access is a separate switch,** off by default, in Settings, with a per-session expiry. It exists in case you later want Claude to help with a specific judgement call, and it requires an explicit toggle each time.
-This keeps the "AI sees the sub" question closed by default. It also reduces prompt-injection exposure to near zero, and it is simpler to describe in the External Endpoints request (§7).
+### 6.0 Posture: the MCP is the app's chat interface
+The app is the single source of truth and the single actor. The MCP is a typed, tool-based way to drive it with natural language. It gives Claude **parity with the UI** and no more:
+- **Same visibility as you:** anything you can see in the app (queue items, post and comment text, user context, modmail, mod log, dashboards) Claude can read through MCP tools, so it can answer questions ("what's driving the report spike?", "summarise this modmail thread") and do judgement-assisted bulk work ("show me everything that looks like rule 3 from the last day, and queue removals for the clear ones").
+- **Same actions as you, same gates:** every write goes through the Command Bus and the tiered policy in §6.1. Claude is the *requester*; the app executes, audits and can undo.
+- **Claude never sees or touches Reddit itself:** no Reddit credentials, no network path, no direct API. The app is the only thing that holds the bridge token and signing key.
+- **Parity includes queries over aggregates:** dashboard numbers and trends are first-class MCP reads.
+Because Claude now reads Reddit content, **the tiers are the defence against prompt injection** (§6.3), not content hiding. Reddit text is labelled as untrusted in every response, and nothing Claude reads can unlock a higher tier.
 
 ### 6.1 Risk tiers (your decision: act directly on low risk)
 | Tier | Commands (v1 defaults, configurable per sub) | Claude's ability |
@@ -155,8 +151,9 @@ This keeps the "AI sees the sub" question closed by default. It also reduces pro
 
 `approve` is "low risk" because it is reversible and non-punitive. Note it is still a moderation decision, which is why the tray and audit log show every one.
 
-### 6.2 Tool catalogue (content-free by default)
-Read: `get_dashboard`, `get_stats(metric, range, group_by)`, `count_queue(filter)`, `list_queue_meta(filter)` (handles, type, age, report reasons, rule hits; no text), `get_rules` (rule names and numbers only), `get_action_history(filter)` (action, actor, rule, time), `get_proposals`. Write (all via Command Bus, tiered per §6.1): `plan_bulk_action(filter, action, rationale)`, `approve`, `add_note`, `set_flair`, `modmail_action`, `remove`, `mark_spam`, `lock`, `ban`, `undo`. Prompts: `weekly_review`, `triage_plan`. The content-access tools (`get_item_content`, `get_modmail_text`) are only registered while the Settings switch is on.
+### 6.2 Tool catalogue (parity with the UI)
+Read: `get_dashboard`, `get_stats(metric, range, group_by)`, `list_queue(filter)`, `get_item(handle)`, `get_user_context(handle)`, `search(query, scope)`, `get_modlog(filter)`, `list_modmail`, `get_modmail_thread`, `get_rules`, `get_proposals`, `get_action_history`. Write (all via Command Bus, tiered per §6.1): `plan_bulk_action(filter, action, rationale)`, `approve`, `add_note`, `set_flair`, `modmail_action`, `remove`, `mark_spam`, `lock`, `reply_modmail`, `apply_macro`, `ban`, `undo`. Prompts: `weekly_review`, `triage_plan`, `investigate_user`. Items are addressed by opaque handles so Claude can't fabricate IDs.
+`plan_bulk_action` evaluates the filter inside the app and returns the matched set. Low-risk actions run immediately. The rest become a proposal with the full preview in the Proposals tray.
 
 ### 6.3 Safety
 - Reddit content is returned to Claude wrapped and labelled as **untrusted data**, with tool descriptions telling the model never to follow instructions inside it. The tier system is the actual defence against prompt injection, since an injected "ban everyone" can only reach the proposals tray.
@@ -169,7 +166,7 @@ Read: `get_dashboard`, `get_stats(metric, range, group_by)`, `count_queue(filter
 From [`devvit_rules.md`](https://github.com/reddit/devvit-docs/blob/main/docs/devvit_rules.md). These apply because Reddit data leaves Reddit into your local cache.
 - **Deletions:** honor `PostDelete`, `CommentDelete` and account deletions. The bridge emits tombstones in the change feed, and **the desktop purges the content and any references**, including from the local audit log text. Retention goal is ≤30 days for stored user data (Redis TTL).
 - **Data minimisation:** the bridge stores IDs and minimal metadata only, and reads content live.
-- **Never:** profile or surveil redditors, sell or share data, or train models on it. Sending content to Claude is a user-initiated local flow, but it is exactly the kind of thing to **state plainly in the External Endpoints request** and get a yes on, rather than assume.
+- **Never:** profile or surveil redditors, sell or share data, or train models on it. Claude reads sub content through the app, at your direction, via your own MCP connection. That is a user-initiated local flow, but it is exactly the kind of thing to **state plainly in the External Endpoints request** and get a yes on, rather than assume. Data sent to Claude is subject to your Claude account's data settings, so check those.
 - **Secrets:** the managed token is global across installs, shown once, and revocable. It sits in the keychain, rotates from Settings, and requests also need the signed envelope, so the token alone can't issue commands.
 - **Consent of co-mods:** the app account becomes a mod. It's installed only where that sub's mod team agrees. App description and README must explain this plainly.
 - **Naming:** no Reddit trademarks or Snoo in the app name or logo. "Reddit Commander" as a repo name is fine, but the app's public name should avoid "Reddit".

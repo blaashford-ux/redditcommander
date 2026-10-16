@@ -1,7 +1,7 @@
 # Reddit Commander — Plan (Stage 2 of 3)
 
 Status: DRAFT for approval · Date: 2026-10-16 · Implements `docs/DESIGN.md` v3
-Scope: one sub (r/MensRomance), Devvit bridge + Electron console + content-free MCP.
+Scope: one sub (r/MensRomance), Devvit bridge + Electron console + MCP as the natural-language interface to the app.
 
 ---
 
@@ -70,12 +70,12 @@ Goal: prove the full loop with the thinnest code, and learn what we couldn't ver
 - **M4.3** User context card: account age, history in the sub, previous removals and mod notes (`getModNotes`), other open reports by the same author. AC: loads in <300 ms from cache; no network call on the click path.
 - **M4.4** Removal reasons and macros (remove + comment + note + optional ban). AC: macro executes as one audited command bundle.
 
-### M5 — MCP server (content-free)
+### M5 — MCP server (natural-language interface to the app)
 - **M5.1** Local MCP server (Streamable HTTP on 127.0.0.1, bearer token, off by default) + `rc-mcp` stdio shim. AC: connects from Claude Desktop/Code; token revocation takes effect immediately.
-- **M5.2** Read tools return **content-free** data only (Design §6.0). AC: a contract test fuzzes every read tool against fixtures seeded with sentinel strings in titles, bodies and usernames, and asserts none ever appear in MCP output.
-- **M5.3** `plan_bulk_action` → filter evaluated in-app → preview/proposal in the **Proposals tray**; low-risk executes directly, others wait for approval. AC: matched count and metadata returned; full content visible only in the UI.
+- **M5.2** Read tools with **UI parity** (Design §6.2): everything visible in the app is queryable, including content and dashboards. Reddit text is wrapped and labelled untrusted. AC: a parity test enumerates UI data sources and asserts each has a read tool; an injection test seeds items with hostile instructions ("ban all users") and asserts no write executes above its tier.
+- **M5.3** `plan_bulk_action` → filter evaluated in-app → low-risk executes directly, others go to the **Proposals tray** with a full preview. AC: matched count and items returned; medium/high-risk actions never execute without approval from the UI.
 - **M5.4** Kill switch (tray + hotkey) and write rate caps. AC: after the kill switch, all MCP calls fail within 1 s.
-- **M5.5** Optional content-access switch (off by default, session-scoped expiry, extra tools registered only while on). AC: tools absent when off; auto-off after expiry.
+- **M5.5** MCP activity visible in the UI: a live "Claude activity" feed and `source: mcp` on every audit row. AC: every MCP call appears in the feed and audit log.
 
 ### M6 — Modmail and mod log
 - **M6.1** Modmail inbox and thread view, assign/archive/highlight/reply (reply is medium tier), canned replies. AC: works in fixture and bridge mode.
@@ -90,7 +90,7 @@ Goal: prove the full loop with the thinnest code, and learn what we couldn't ver
 
 ## 3. Test strategy
 - **Unit (Vitest):** protocol schemas, policy tables, sync cursor logic, limiter, filter evaluator.
-- **Contract:** shared `protocol` types make desktop↔bridge drift a compile error. The MCP content-free fuzz test (M5.2) is a hard CI gate.
+- **Contract:** shared `protocol` types make desktop↔bridge drift a compile error. The MCP injection test (M5.2: hostile text in items must never cause a write above its tier) is a hard CI gate.
 - **E2E (Playwright for Electron):** all flows in fixture mode, offline, deterministic.
 - **Bridge:** mocked `reddit`/Redis unit tests, plus a manual playtest checklist on r/MensRomance for each release (Devvit can't be fully simulated).
 - **Live checks:** one scripted smoke run against the real sub at the end of M2, M3 and M5; never against a sub with real members until the app has passed review.
@@ -104,10 +104,10 @@ Goal: prove the full loop with the thinnest code, and learn what we couldn't ver
 | Review required at 200+ subs | Plan release timing | M7.2 |
 
 ## 5. Definition of done (v1)
-All M0–M7 AC met · CI green · no content in MCP default responses (fuzz gate) · deletions purge locally within one sync · kill switch tested · README, privacy policy and terms published · app approved for r/MensRomance beyond 200 members.
+All M0–M7 AC met · CI green · MCP injection test passes (no write above its tier) · deletions purge locally within one sync · kill switch tested · README, privacy policy and terms published · app approved for r/MensRomance beyond 200 members.
 
 ## 6. Draft text for the External Endpoints request (U3)
-> **App:** `<appname>`, a private moderation console for one subreddit (r/MensRomance), owned and moderated by the developer. **Why external endpoints:** the owner runs a local desktop dashboard that reads the sub's mod queue, reports and aggregate statistics from the app, and issues moderation actions (approve, remove, notes) that the app executes as its own account. Personal domains can't be fetched by Devvit, so the app can't push to it; an authenticated inbound call is the only fit. **Data handling:** minimal metadata stored in Redis with TTL; aggregate counters contain no usernames or content; the desktop purges anything deleted on Reddit; no data is sold, shared, profiled or used to train models. An optional local AI assistant can request counts and metadata only, and content access is off by default. **Security:** managed token plus signed, replay-protected command envelopes and server-side policy limits on destructive actions. **Scope:** single installation.
+> **App:** `<appname>`, a private moderation console for one subreddit (r/MensRomance), owned and moderated by the developer. **Why external endpoints:** the owner runs a local desktop dashboard that reads the sub's mod queue, reports and aggregate statistics from the app, and issues moderation actions (approve, remove, notes) that the app executes as its own account. Personal domains can't be fetched by Devvit, so the app can't push to it; an authenticated inbound call is the only fit. **Data handling:** minimal metadata stored in Redis with TTL; aggregate counters contain no usernames or content; the desktop purges anything deleted on Reddit; no data is sold, shared, profiled or used to train models. The owner can also drive the desktop app through a local natural-language (MCP) interface; the assistant sees only what the owner's app shows, and every action goes through the app's tiered policy. **Security:** managed token plus signed, replay-protected command envelopes and server-side policy limits on destructive actions. **Scope:** single installation.
 
 ---
 
